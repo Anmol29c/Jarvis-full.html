@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>JARVIS // Full Interface</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #000;
+    color: #00eaff;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+  }
+  #wrap {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+  }
+  video, canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  video { transform: scaleX(-1); }
+  canvas { transform: scaleX(-1); }
+  #status {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    font-size: 13px;
+    letter-spacing: 2px;
+    text-shadow: 0 0 8px #00eaff;
+    z-index: 20;
+    line-height: 1.6;
+  }
+  #gesture {
+    position: absolute;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 28px;
+    font-weight: bold;
+    letter-spacing: 4px;
+    text-shadow: 0 0 20px #00eaff, 0 0 40px #00eaff;
+    z-index: 20;
+  }
+  #corners div {
+    position: absolute;
+    width: 40px;
+    height: 40px;
+    border: 2px solid #00eaff;
+    box-shadow: 0 0 10px #00eaff;
+    z-index: 20;
+  }
+  .tl { top: 20px; left: 20px; border-right: none; border-bottom: none; }
+  .tr { top: 20px; right: 20px; border-left: none; border-bottom: none; }
+  .bl { bottom: 20px; left: 20px; border-right: none; border-top: none; }
+  .br { bottom: 20px; right: 20px; border-left: none; border-top: none; }
+  #loading {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 16px;
+    letter-spacing: 3px;
+    z-index: 30;
+    text-shadow: 0 0 10px #00eaff;
+    text-align: center;
+  }
+  #hint {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    font-size: 11px;
+    letter-spacing: 1px;
+    opacity: 0.7;
+    z-index: 20;
+    text-align: right;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<div id="wrap">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="hud"></canvas>
+  <div id="corners">
+    <div class="tl"></div><div class="tr"></div>
+    <div class="bl"></div><div class="br"></div>
+  </div>
+  <div id="status">JARVIS INTERFACE // INITIALIZING...</div>
+  <div id="hint">
+    OPEN PALM = repulsor charge<br>
+    THRUST PALM FORWARD = FIRE<br>
+    FIST = power down
+  </div>
+  <div id="gesture"></div>
+  <div id="loading">LOADING NEURAL MODELS...<br><span style="font-size:12px;opacity:0.6">hands + face + body</span></div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FaceLandmarker, PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('hud');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const gestureEl = document.getElementById('gesture');
+const loadingEl = document.getElementById('loading');
+
+let handLandmarker, faceLandmarker, poseLandmarker;
+let particles = [];
+let lastPalmZ = {}; // track palm depth per hand to detect "thrust"
+let fireCooldown = {};
+
+async function init() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 2
+  });
+
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+
+  faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numFaces: 1
+  });
+
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+  video.srcObject = stream;
+
+  video.addEventListener('loadeddata', () => {
+    loadingEl.style.display = 'none';
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    predictLoop();
+  });
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+// ---------- GESTURE DETECTION ----------
+function detectHandGesture(landmarks) {
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+  const middleTip = landmarks[12];
+  const ringTip = landmarks[16];
+  const pinkyTip = landmarks[20];
+  const indexBase = landmarks[5];
+  const middleBase = landmarks[9];
+  const ringBase = landmarks[13];
+  const pinkyBase = landmarks[17];
+
+  const indexUp = indexTip.y < indexBase.y;
+  const middleUp = middleTip.y < middleBase.y;
+  const ringUp = ringTip.y < ringBase.y;
+  const pinkyUp = pinkyTip.y < pinkyBase.y;
+  const pinchDist = dist(thumbTip, indexTip);
+
+  if (pinchDist < 0.05) return "PINCH";
+  if (indexUp && middleUp && ringUp && pinkyUp) return "OPEN_PALM";
+  if (!indexUp && !middleUp && !ringUp && !pinkyUp) return "FIST";
+  if (indexUp && !middleUp && !ringUp && !pinkyUp) return "POINTING";
+  if (indexUp && middleUp && !ringUp && !pinkyUp) return "PEACE";
+  return "TRACKING";
+}
+
+// ---------- PARTICLE / REPULSOR FX ----------
+function spawnBlast(x, y, dirX, dirY) {
+  for (let i = 0; i < 35; i++) {
+    const spread = (Math.random() - 0.5) * 0.6;
+    const speed = 8 + Math.random() * 10;
+    particles.push({
+      x, y,
+      vx: (dirX + spread) * speed,
+      vy: (dirY + spread) * speed,
+      life: 1,
+      size: 2 + Math.random() * 4
+    });
+  }
+}
+
+function spawnCharge(x, y) {
+  for (let i = 0; i < 2; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const r = 30 + Math.random() * 20;
+    particles.push({
+      x: x + Math.cos(angle) * r,
+      y: y + Math.sin(angle) * r,
+      vx: -Math.cos(angle) * 2,
+      vy: -Math.sin(angle) * 2,
+      life: 0.6,
+      size: 2,
+      charge: true,
+      target: { x, y }
+    });
+  }
+}
+
+function updateParticles() {
+  ctx.globalCompositeOperation = 'lighter';
+  particles = particles.filter(p => p.life > 0);
+  particles.forEach(p => {
+    if (p.charge) {
+      p.x += (p.target.x - p.x) * 0.15;
+      p.y += (p.target.y - p.y) * 0.15;
+    } else {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vx *= 0.96;
+      p.vy *= 0.96;
+    }
+    p.life -= 0.03;
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0, 234, 255, ${p.life})`;
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = '#00eaff';
+    ctx.fill();
+  });
+  ctx.shadowBlur = 0;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// ---------- DRAWING ----------
+function drawConnections(landmarks, connections, color) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = color;
+  connections.forEach(([a, b]) => {
+    if (!landmarks[a] || !landmarks[b]) return;
+    ctx.beginPath();
+    ctx.moveTo(landmarks[a].x * canvas.width, landmarks[a].y * canvas.height);
+    ctx.lineTo(landmarks[b].x * canvas.width, landmarks[b].y * canvas.height);
+    ctx.stroke();
+  });
+  ctx.shadowBlur = 0;
+}
+
+function drawPoints(landmarks, color, radius) {
+  ctx.fillStyle = color;
+  landmarks.forEach(pt => {
+    ctx.beginPath();
+    ctx.arc(pt.x * canvas.width, pt.y * canvas.height, radius, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]
+];
+
+const POSE_CONNECTIONS = [
+  [11,12],[11,13],[13,15],[12,14],[14,16],
+  [11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],
+  [15,17],[15,19],[15,21],[16,18],[16,20],[16,22],
+  [27,29],[27,31],[28,30],[28,32]
+];
+
+const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109,10];
+
+function predictLoop() {
+  const now = performance.now();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // POSE (body skeleton)
+  const poseResult = poseLandmarker.detectForVideo(video, now);
+  if (poseResult.landmarks && poseResult.landmarks.length > 0) {
+    poseResult.landmarks.forEach(lm => {
+      drawConnections(lm, POSE_CONNECTIONS, 'rgba(0,234,255,0.5)');
+      drawPoints(lm, 'rgba(0,234,255,0.6)', 3);
+    });
+  }
+
+  // FACE (contour mesh)
+  const faceResult = faceLandmarker.detectForVideo(video, now);
+  if (faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0) {
+    faceResult.faceLandmarks.forEach(lm => {
+      const ovalConns = [];
+      for (let i = 0; i < FACE_OVAL.length - 1; i++) {
+        ovalConns.push([FACE_OVAL[i], FACE_OVAL[i+1]]);
+      }
+      drawConnections(lm, ovalConns, 'rgba(0,255,200,0.7)');
+      // sparse mesh dots for a "scan" feel
+      const sparse = lm.filter((_, i) => i % 5 === 0);
+      drawPoints(sparse, 'rgba(0,255,200,0.4)', 1.2);
+    });
+  }
+
+  // HANDS + gestures + fire fx
+  const handResult = handLandmarker.detectForVideo(video, now);
+  let currentGesture = '';
+  if (handResult.landmarks && handResult.landmarks.length > 0) {
+    handResult.landmarks.forEach((lm, idx) => {
+      drawConnections(lm, HAND_CONNECTIONS, '#00eaff');
+      drawPoints(lm, '#00eaff', 4);
+
+      const g = detectHandGesture(lm);
+      currentGesture = g;
+
+      const palmCenter = lm[9]; // middle finger base ~ palm center
+      const wrist = lm[0];
+      const px = palmCenter.x * canvas.width;
+      const py = palmCenter.y * canvas.height;
+
+      // direction palm is facing (wrist -> palm center, extended outward)
+      const dirX = (palmCenter.x - wrist.x);
+      const dirY = (palmCenter.y - wrist.y);
+      const mag = Math.hypot(dirX, dirY) || 1;
+      const ndx = dirX / mag;
+      const ndy = dirY / mag;
+
+      const key = 'hand' + idx;
+      const z = wrist.z; // depth, more negative = closer to camera
+
+      if (g === 'OPEN_PALM') {
+        spawnCharge(px, py);
+
+        // detect forward thrust: z suddenly decreasing (hand moving toward camera)
+        if (lastPalmZ[key] !== undefined) {
+          const dz = lastPalmZ[key] - z;
+          const cooldown = fireCooldown[key] || 0;
+          if (dz > 0.04 && now - cooldown > 500) {
+            spawnBlast(px, py, ndx, ndy);
+            fireCooldown[key] = now;
+          }
+        }
+        lastPalmZ[key] = z;
+      } else {
+        lastPalmZ[key] = z;
+      }
+    });
+  }
+
+  updateParticles();
+
+  gestureEl.textContent = currentGesture.replace('_', ' ');
+
+  const parts = [];
+  if (poseResult.landmarks?.length) parts.push('BODY');
+  if (faceResult.faceLandmarks?.length) parts.push('FACE');
+  if (handResult.landmarks?.length) parts.push(handResult.landmarks.length + ' HAND(S)');
+  statusEl.textContent = 'JARVIS // TRACKING: ' + (parts.length ? parts.join(' + ') : 'NOTHING DETECTED');
+
+  requestAnimationFrame(predictLoop);
+}
+
+init().catch(err => {
+  loadingEl.innerHTML = 'ERROR: ' + err.message;
+  console.error(err);
+});
+</script>
+
+</body>
+</html>
